@@ -78,6 +78,89 @@ int DoBiggie()
     // for multithreading we have some work to multithread
     std::cout << "Hello World!\n"<<sum[0].v+ sum[1].v+ sum[2].v+ sum[3].v;
 }
+class MasterControl {
+public:
+    MasterControl(int workerCount):lk{mtx},workerCount{workerCount}{}
+    void SignalDone() {
+        {
+            std::lock_guard lk{ mtx };
+            ++doneCount;
+        }
+        if (doneCount == workerCount)
+        {
+            cv.notify_one();
+        }
+    }
+    void WaitForAllDone()
+    {
+        cv.wait(lk, [this] {return doneCount == workerCount;});
+        doneCount = 0;
+    }
+private:
+    std::condition_variable cv;
+    std::mutex mtx;
+    std::unique_lock<std::mutex>lk;
+    int workerCount;
+    //shared memory 
+    int doneCount = 0;
+};
+class Worker
+{
+public:
+    Worker(MasterControl* pMaster) :pMaster{ pMaster }, thread{&Worker::Run_, this
+//when we want to run a thread on the member function so we have to pass
+// first pointer to the memeber function 
+//second enstance of the member function 
+}{}
+    void SetJob(std::span<int>data, int* pOut) {
+        {
+            std::lock_guard lk{ mtx };
+            input = data;
+            pOutput = pOut;
+        }
+        cv.notify_one();
+}
+    void Kill()
+    {
+        {
+            std::lock_guard lk{ mtx };
+            dying = true;
+        }
+        cv.notify_one();
+    }
+
+private:
+    void Run_()
+    {
+        std::unique_lock lk{ mtx };// we are locking the mutex;
+        //to prevent the multiple excess
+        while (true)// we are running to ensure worker thread is always ready for new work 
+        {
+            cv.wait(lk, [this] {return pOutput != nullptr || dying;});
+            // we have to wait for newwork until we get it 
+            //pOutput= true means we get new work 
+            // dying is true means now we donot have any work just die the thread 
+
+            if (dying)
+            {
+                break;
+            }
+            ProcessDataset(input, *pOutput,mtx);//process the curring data which we get it
+            pOutput = nullptr;// make the output is nullptr that we donot have new work
+            input = {};//make input empty
+            pMaster->SignalDone();//mark the main thread that we are done 
+        }
+    }
+    MasterControl* pMaster;
+    std::jthread thread;
+    std::condition_variable cv;
+    std::mutex mtx;
+    //shared memory 
+    std::span<int> input;
+    int* pOutput = nullptr;
+    bool dying = false;
+
+};
 int DoSmallies() {
     auto datasets = GenerateDatasets();
     std::vector<std::jthread> workers;
@@ -90,17 +173,32 @@ int DoSmallies() {
     int grandTotal = 0;
     std::mutex mtx;
     constexpr const auto subsetSize = DATASET_SIZE / 10000;
+    constexpr size_t workerCount = 4;
+    MasterControl mctrl{ workerCount };
+    std::vector<std::unique_ptr<Worker>> workerPtrs;
+    for (size_t i = 0;i < workerCount;i++)
+    {
+        workerPtrs.push_back(std::make_unique<Worker>(&mctrl));
+    }
     for(size_t i = 0;i < DATASET_SIZE;i+=subsetSize)
     {
         for (int j = 0;j < 4;j++)
         {
-            workers.push_back(std::jthread{ ProcessDataset, std::span{&datasets[j][i],subsetSize},std::ref(sum[j].v),std::ref(mtx)});
+            workerPtrs[j]->SetJob(std::span{ &datasets[j][i],subsetSize }, &sum[j].v);
+          /*  workers.push_back(std::jthread{ ProcessDataset, std::span{&datasets[j][i],subsetSize},std::ref(sum[j].v),std::ref(mtx)});*/
         }
-        workers.clear();
+        mctrl.WaitForAllDone();
         //when we clear then threads get distroyed and jthread distructor will be called 
         // we do not have to join
-        grandTotal = sum[0].v + sum[1].v + sum[2].v + sum[3].v;
+        
+
     }
+    grandTotal = sum[0].v + sum[1].v + sum[2].v + sum[3].v;
+    for (auto& w : workerPtrs)
+    {
+        w->Kill();
+    }
+    //workerPtrs.clear();
     return 0;
 }
 int main(int argc, char** argv) {
